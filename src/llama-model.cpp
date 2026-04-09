@@ -5727,12 +5727,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             // MoE branch
                             const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
 
-                            layer.ffn_gate_exps = create_tensor(
-                                tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), { n_embd, n_ff_exp, n_expert }, flags);
-                            layer.ffn_down_exps = create_tensor(
+                            layer.ffn_down_exps = create_routed_expert_tensor(
                                 tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, flags);
-                            layer.ffn_up_exps = create_tensor(
-                                tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i), { n_embd, n_ff_exp, n_expert }, flags);
+                            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, flags);
 
                             // Shared expert
                             if (n_expert_shared > 0) {
