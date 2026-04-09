@@ -470,6 +470,18 @@ static ggml_backend_buffer_t llama_flash_moe_alloc_sparse_ctx_buffer(
         return nullptr;
     }
 
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+
+    // GPU with dedicated VRAM (CUDA/Vulkan): allocate directly in VRAM
+    // The mmap+buffer_from_host_ptr path only works on unified memory (Metal/Apple Silicon)
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU
+            && !props.caps.buffer_from_host_ptr) {
+        LLAMA_LOG_INFO("%s: allocating Flash-MoE slot-bank directly in VRAM (%.2f GiB) via %s\n",
+                log_tag, requested_size / 1024.0 / 1024.0 / 1024.0, ggml_backend_buft_name(buft));
+        return ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    }
+
     const long page_size_raw = sysconf(_SC_PAGESIZE);
     const size_t page_size = page_size_raw > 0 ? size_t(page_size_raw) : size_t(4096);
     const size_t mapped_size = GGML_PAD(requested_size, page_size);
@@ -481,8 +493,6 @@ static ggml_backend_buffer_t llama_flash_moe_alloc_sparse_ctx_buffer(
     }
 
     ggml_backend_buffer_t buffer = nullptr;
-    ggml_backend_dev_props props;
-    ggml_backend_dev_get_props(dev, &props);
     const bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
     if (props.caps.buffer_from_host_ptr && is_default_buft) {
         buffer = ggml_backend_dev_buffer_from_host_ptr(dev, sparse_base, mapped_size, ggml_get_max_tensor_size(ctx));
