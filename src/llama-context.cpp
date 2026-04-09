@@ -171,7 +171,8 @@ public:
 
     bool uses_native_slot_map(int layer) const override {
         return uses_layer(layer) &&
-                (model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_DEEPSEEK2) &&
+                (model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_DEEPSEEK2 ||
+                 model.arch == LLM_ARCH_GLM4_MOE  || model.arch == LLM_ARCH_GLM_DSA) &&
                 !native_slot_map_disabled();
     }
 
