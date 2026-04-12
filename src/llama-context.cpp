@@ -110,6 +110,15 @@ public:
             resident_full_bank_pending = slot_count == expert_count;
         }
 
+        {
+            const char * ram_budget = std::getenv("LLAMA_FLASH_MOE_RAM_CACHE_GB");
+            if (ram_budget && std::atoi(ram_budget) > 0) {
+                ram_cache_max_bytes = size_t(std::atoi(ram_budget)) * 1024ull * 1024ull * 1024ull;
+                LLAMA_LOG_INFO("%s: Flash-MoE RAM cache enabled: %.1f GiB budget\n",
+                        __func__, ram_cache_max_bytes / 1024.0 / 1024.0 / 1024.0);
+            }
+        }
+
         if (parallel_slot_reads || cache_io_split > 1) {
             start_read_pool();
         }
@@ -668,6 +677,36 @@ private:
     std::mutex fds_mutex;
     std::unordered_map<std::string, int> fds;
     std::unordered_map<std::string, resident_bank_file> resident_banks;
+
+    // 3-tier cache: RAM layer between VRAM slots and SSD sidecar.
+    // Key uses (path, base_offset, expert): all tensor families in a layer
+    // share the same file (layer_NNN.bin) but have different repacked_offset.
+    struct ram_cache_key {
+        std::string path;
+        size_t base_offset;
+        int expert;
+        bool operator==(const ram_cache_key & o) const {
+            return expert == o.expert && base_offset == o.base_offset && path == o.path;
+        }
+    };
+    struct ram_cache_key_hash {
+        size_t operator()(const ram_cache_key & k) const {
+            return std::hash<std::string>()(k.path)
+                 ^ (std::hash<size_t>()(k.base_offset) << 8)
+                 ^ (std::hash<int>()(k.expert) << 20);
+        }
+    };
+    struct ram_cache_entry {
+        std::vector<uint8_t> data;
+        uint64_t last_access_age = 0;
+        uint32_t access_count = 0;
+    };
+    std::unordered_map<ram_cache_key, ram_cache_entry, ram_cache_key_hash> ram_cache;
+    size_t ram_cache_used_bytes = 0;
+    size_t ram_cache_max_bytes  = 0;
+    uint64_t ram_cache_hits   = 0;
+    uint64_t ram_cache_misses = 0;
+
     std::unordered_map<ggml_backend_dev_t, async_slot_uploader> async_uploaders;
     read_thread_pool read_pool;
     std::vector<int32_t> topk_ids;
@@ -1443,6 +1482,13 @@ private:
                     total.up_install_us / 1000.0, total.up_bytes / 1024.0 / 1024.0 / 1024.0,
                     total.down_install_us / 1000.0, total.down_bytes / 1024.0 / 1024.0 / 1024.0);
         }
+        if (ram_cache_max_bytes > 0) {
+            LLAMA_LOG_INFO("%s: Flash-MoE RAM cache hits=%" PRIu64 " misses=%" PRIu64 " used=%.2f GiB / %.2f GiB entries=%zu\n",
+                    __func__, ram_cache_hits, ram_cache_misses,
+                    ram_cache_used_bytes / 1024.0 / 1024.0 / 1024.0,
+                    ram_cache_max_bytes / 1024.0 / 1024.0 / 1024.0,
+                    ram_cache.size());
+        }
         LLAMA_LOG_INFO("%s: Flash-MoE residency cold=%" PRIu64 " evict=%" PRIu64 "\n",
                 __func__, total.cold_loads, total.evict_loads);
 
@@ -1813,6 +1859,60 @@ private:
         return metrics;
     }
 
+    const uint8_t * lookup_ram_cache(const llama_flash_moe_sidecar_entry * entry, int32_t expert) {
+        if (ram_cache_max_bytes == 0 || entry == nullptr) {
+            return nullptr;
+        }
+        ram_cache_key key{entry->repacked_path, entry->repacked_offset, expert};
+        auto it = ram_cache.find(key);
+        if (it == ram_cache.end()) {
+            return nullptr;
+        }
+        it->second.last_access_age = age;
+        it->second.access_count++;
+        return it->second.data.data();
+    }
+
+    void insert_ram_cache(const llama_flash_moe_sidecar_entry * entry, int32_t expert,
+                          const uint8_t * data, size_t bytes) {
+        if (ram_cache_max_bytes == 0 || entry == nullptr) {
+            return;
+        }
+        while (ram_cache_used_bytes + bytes > ram_cache_max_bytes && !ram_cache.empty()) {
+            evict_ram_cache_lfu();
+        }
+        if (ram_cache_used_bytes + bytes > ram_cache_max_bytes) {
+            return;
+        }
+        ram_cache_key key{entry->repacked_path, entry->repacked_offset, expert};
+        auto & e = ram_cache[key];
+        if (!e.data.empty()) {
+            ram_cache_used_bytes -= e.data.size();
+        }
+        e.data.assign(data, data + bytes);
+        e.last_access_age = age;
+        e.access_count = 1;
+        ram_cache_used_bytes += bytes;
+    }
+
+    void evict_ram_cache_lfu() {
+        auto victim = ram_cache.end();
+        uint32_t min_count = std::numeric_limits<uint32_t>::max();
+        uint64_t oldest = std::numeric_limits<uint64_t>::max();
+        for (auto it = ram_cache.begin(); it != ram_cache.end(); ++it) {
+            if (it->second.access_count < min_count ||
+                (it->second.access_count == min_count && it->second.last_access_age < oldest)) {
+                min_count = it->second.access_count;
+                oldest = it->second.last_access_age;
+                victim = it;
+            }
+        }
+        if (victim != ram_cache.end()) {
+            ram_cache_used_bytes -= victim->second.data.size();
+            ram_cache.erase(victim);
+        }
+    }
+
     install_metrics read_expert_bytes(
             ggml_tensor * tensor,
             const llama_flash_moe_sidecar_entry * entry,
@@ -1853,6 +1953,17 @@ private:
             metrics.install_us += metrics.source_us;
             return metrics;
         }
+
+        // 3-tier: check RAM cache before SSD pread
+        if (const uint8_t * cached = lookup_ram_cache(entry, expert)) {
+            std::memcpy(out, cached, entry->bytes_per_expert);
+            metrics.source_us += ggml_time_us() - t_read_start_us;
+            metrics.resident_copy_ops++;
+            ram_cache_hits++;
+            metrics.install_us += metrics.source_us;
+            return metrics;
+        }
+        ram_cache_misses++;
 
         const int fd = fd_for(entry->repacked_path);
         const int32_t chunks = active_cache_io_split(entry->bytes_per_expert, cache_io_split);
@@ -1908,6 +2019,9 @@ private:
                     expert, entry->tensor_name.c_str(), entry->repacked_path.c_str()));
             }
         }
+
+        // 3-tier: cache the data we just read from SSD into RAM
+        insert_ram_cache(entry, expert, out, entry->bytes_per_expert);
 
         metrics.install_us += metrics.source_us;
         return metrics;
