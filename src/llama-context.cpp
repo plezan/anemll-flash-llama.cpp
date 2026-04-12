@@ -2099,6 +2099,30 @@ private:
         return metrics;
     }
 
+    void save_evicted_to_ram_cache(const layer_state & state, int32_t expert, int32_t slot) {
+        if (ram_cache_max_bytes == 0) {
+            return;
+        }
+
+        auto save_one = [&](const ggml_tensor * tensor, const llama_flash_moe_sidecar_entry * entry) {
+            if (tensor == nullptr || entry == nullptr) {
+                return;
+            }
+            if (lookup_ram_cache(entry, expert) != nullptr) {
+                return;
+            }
+            std::vector<uint8_t> buf(entry->bytes_per_expert);
+            ggml_backend_tensor_get(tensor, buf.data(),
+                    size_t(slot) * entry->bytes_per_expert, entry->bytes_per_expert);
+            insert_ram_cache(entry, expert, buf.data(), entry->bytes_per_expert);
+        };
+
+        save_one(state.gate_up_tensor, state.gate_up_entry);
+        save_one(state.gate_tensor,    state.gate_entry);
+        save_one(state.up_tensor,      state.up_entry);
+        save_one(state.down_tensor,    state.down_entry);
+    }
+
     install_metrics install_loads(layer_state & state, const std::vector<std::pair<int32_t, int32_t>> & pending_loads) {
         install_metrics totals;
         totals.experts = pending_loads.size();
@@ -2111,6 +2135,7 @@ private:
         for (const auto & [expert, slot] : pending_loads) {
             const int32_t evicted = state.slot_to_expert[slot];
             if (evicted >= 0 && evicted < expert_count) {
+                save_evicted_to_ram_cache(state, evicted, slot);
                 state.expert_to_slot[evicted] = -1;
                 totals.evict_loads++;
             } else {
