@@ -72,6 +72,7 @@ public:
             state.slot_to_expert.assign(slot_count, -1);
             state.expert_to_slot.assign(expert_count, -1);
             state.slot_age.assign(slot_count, 0);
+            state.slot_access_count.assign(slot_count, 0);
             state.slot_reserved_epoch.assign(slot_count, 0);
             state.request_seen_epoch.assign(expert_count, 0);
             state.request_slot.assign(expert_count, -1);
@@ -445,6 +446,15 @@ private:
 
         for (const int32_t slot : touched_slots) {
             state.slot_age[slot] = ++age;
+            state.slot_access_count[slot]++;
+        }
+
+        // LFU decay: halve all access counts periodically so stale experts lose priority
+        constexpr uint64_t lfu_decay_interval = 64;
+        if (age % lfu_decay_interval == 0) {
+            for (int32_t s = 0; s < state.n_slots; ++s) {
+                state.slot_access_count[s] >>= 1;
+            }
         }
 
         const int64_t t_trace_start_us = ggml_time_us();
@@ -620,6 +630,7 @@ private:
         std::vector<int32_t>  slot_to_expert;
         std::vector<int32_t>  expert_to_slot;
         std::vector<uint64_t> slot_age;
+        std::vector<uint32_t> slot_access_count;
         std::vector<uint32_t> slot_reserved_epoch;
         std::vector<uint32_t> request_seen_epoch;
         std::vector<int32_t>  request_slot;
@@ -1532,14 +1543,20 @@ private:
             }
         }
 
+        // LFU+LRU eviction: prefer the least frequently used slot,
+        // break ties by age (oldest first). Access counts decay over
+        // time so stale experts gradually lose their protection.
         int32_t victim = -1;
-        uint64_t oldest = std::numeric_limits<uint64_t>::max();
+        uint32_t min_count = std::numeric_limits<uint32_t>::max();
+        uint64_t oldest_of_min = std::numeric_limits<uint64_t>::max();
         for (int32_t slot = 0; slot < state.n_slots; ++slot) {
             if (state.slot_reserved_epoch[slot] == epoch) {
                 continue;
             }
-            if (state.slot_age[slot] < oldest) {
-                oldest = state.slot_age[slot];
+            if (state.slot_access_count[slot] < min_count ||
+                (state.slot_access_count[slot] == min_count && state.slot_age[slot] < oldest_of_min)) {
+                min_count = state.slot_access_count[slot];
+                oldest_of_min = state.slot_age[slot];
                 victim = slot;
             }
         }
@@ -2328,6 +2345,7 @@ private:
         for (const auto & load : scheduled_loads) {
             state.slot_to_expert[load.slot] = load.expert;
             state.expert_to_slot[load.expert] = load.slot;
+            state.slot_access_count[load.slot] = 1;
         }
 
         totals.upload_us += flush_async_uploads();
