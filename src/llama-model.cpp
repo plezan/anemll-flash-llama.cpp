@@ -2971,13 +2971,50 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 __func__, pimpl->flash_moe_sidecar_entries.size());
     }
 
+    // Auto-compute tensor_split from per-layer slot-bank weights when segments are active
+    // and the user hasn't specified --tensor-split explicitly. This balances VRAM usage
+    // across GPUs by giving more weight to GPUs hosting layers with more slots.
+    std::vector<float> auto_tensor_split;
+    const bool tensor_split_provided = tensor_split != nullptr && std::any_of(
+            tensor_split, tensor_split + n_devices(),
+            [](float x) { return x != 0.0f; });
+    if (!pimpl->flash_moe_per_layer_slot_counts.empty() && !tensor_split_provided
+            && flash_moe_experimental_gpu_bank && n_gpu_layers > 0 && n_devices() > 0) {
+        const int n_gpu = std::min(n_gpu_layers, n_layer);
+        const int auto_i_gpu_start = std::max(0, n_layer - n_gpu);
+        auto_tensor_split.assign(n_devices(), 0.0f);
+        double total_weight = 0.0;
+        for (int il = auto_i_gpu_start; il < n_layer; il++) {
+            double w = (double) pimpl->flash_moe_per_layer_slot_counts[il];
+            if (w <= 0.0) w = (double) flash_moe_slot_count;
+            int gpu_idx = (il - auto_i_gpu_start) * (int) n_devices() / std::max(1, n_gpu);
+            if (gpu_idx >= (int) n_devices()) gpu_idx = (int) n_devices() - 1;
+            auto_tensor_split[gpu_idx] += (float) w;
+            total_weight += w;
+        }
+        if (total_weight > 0.0) {
+            for (float & v : auto_tensor_split) {
+                v = (float) (v / total_weight);
+            }
+            LLAMA_LOG_INFO("%s: Flash-MoE auto-computed tensor-split from slot-bank segments (override with --tensor-split):\n", __func__);
+            for (size_t i = 0; i < n_devices(); i++) {
+                LLAMA_LOG_INFO("%s:   device %zu (%s): weight=%.4f\n",
+                        __func__, i, ggml_backend_dev_name(devices[i]), auto_tensor_split[i]);
+            }
+        } else {
+            auto_tensor_split.clear();
+        }
+    }
+    const float * effective_tensor_split = auto_tensor_split.empty() ?
+            tensor_split : auto_tensor_split.data();
+
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (auto * dev : devices) {
-        buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split);
+        buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, effective_tensor_split);
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev, std::move(buft_list));
@@ -2989,7 +3026,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // calculate the split points
-    bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
+    bool all_zero = effective_tensor_split == nullptr || std::all_of(effective_tensor_split, effective_tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
     if (all_zero) {
         // default split, by free memory
@@ -3008,7 +3045,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             splits[i] = free;
         }
     } else {
-        std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+        std::copy(effective_tensor_split, effective_tensor_split + n_devices(), splits.begin());
     }
 
     // sum and normalize the splits to get the split points
