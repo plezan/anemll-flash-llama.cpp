@@ -2972,8 +2972,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // Auto-compute tensor_split from per-layer slot-bank weights when segments are active
-    // and the user hasn't specified --tensor-split explicitly. This balances VRAM usage
-    // across GPUs by giving more weight to GPUs hosting layers with more slots.
+    // and the user hasn't specified --tensor-split explicitly. The goal is to balance
+    // VRAM cost across GPUs: GPUs that would host heavy (many-slot) layers should receive
+    // FEWER layers so their total slot VRAM cost matches lighter GPUs.
+    //
+    // Algorithm (breakpoint search): find contiguous layer ranges such that the cumulative
+    // slot-cost of each range equals total_cost / n_devices. Express each range length as
+    // a fraction of total offloaded layers; that vector is the tensor_split weights.
     std::vector<float> auto_tensor_split;
     const bool tensor_split_provided = tensor_split != nullptr && std::any_of(
             tensor_split, tensor_split + n_devices(),
@@ -2982,27 +2987,50 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             && flash_moe_experimental_gpu_bank && n_gpu_layers > 0 && n_devices() > 0) {
         const int n_gpu = std::min(n_gpu_layers, n_layer);
         const int auto_i_gpu_start = std::max(0, n_layer - n_gpu);
-        auto_tensor_split.assign(n_devices(), 0.0f);
-        double total_weight = 0.0;
-        for (int il = auto_i_gpu_start; il < n_layer; il++) {
+
+        // Cumulative cost across offloaded layers: cum[i] = sum of weights for first i layers
+        std::vector<double> cum(n_gpu + 1, 0.0);
+        for (int i = 0; i < n_gpu; i++) {
+            const int il = auto_i_gpu_start + i;
             double w = (double) pimpl->flash_moe_per_layer_slot_counts[il];
             if (w <= 0.0) w = (double) flash_moe_slot_count;
-            int gpu_idx = (il - auto_i_gpu_start) * (int) n_devices() / std::max(1, n_gpu);
-            if (gpu_idx >= (int) n_devices()) gpu_idx = (int) n_devices() - 1;
-            auto_tensor_split[gpu_idx] += (float) w;
-            total_weight += w;
+            cum[i + 1] = cum[i] + w;
         }
-        if (total_weight > 0.0) {
-            for (float & v : auto_tensor_split) {
-                v = (float) (v / total_weight);
+        const double total_cost = cum[n_gpu];
+
+        if (total_cost > 0.0) {
+            // Find breakpoints: for each GPU i, the smallest layer count where cum reaches
+            // (i+1) * total_cost / n_devices. GPUs hosting heavier layers reach the target
+            // sooner and therefore receive fewer layers.
+            auto_tensor_split.assign(n_devices(), 0.0f);
+            const size_t n_dev = n_devices();
+            int prev_layer = 0;
+            for (size_t i = 0; i < n_dev; i++) {
+                const double target = (i + 1) * total_cost / (double) n_dev;
+                int next_layer = prev_layer;
+                while (next_layer < n_gpu && cum[next_layer] < target) {
+                    next_layer++;
+                }
+                if (i == n_dev - 1) next_layer = n_gpu;             // last GPU takes rest
+                if (next_layer <= prev_layer) {                      // ensure >= 1 layer each
+                    next_layer = std::min(prev_layer + 1, n_gpu);
+                }
+                auto_tensor_split[i] = (float) (next_layer - prev_layer);
+                prev_layer = next_layer;
             }
+
+            // Normalize so the weights sum to 1 (the downstream code re-normalizes too).
+            float sum = 0.0f;
+            for (float v : auto_tensor_split) sum += v;
+            if (sum > 0.0f) {
+                for (float & v : auto_tensor_split) v /= sum;
+            }
+
             LLAMA_LOG_INFO("%s: Flash-MoE auto-computed tensor-split from slot-bank segments (override with --tensor-split):\n", __func__);
-            for (size_t i = 0; i < n_devices(); i++) {
+            for (size_t i = 0; i < n_dev; i++) {
                 LLAMA_LOG_INFO("%s:   device %zu (%s): weight=%.4f\n",
                         __func__, i, ggml_backend_dev_name(devices[i]), auto_tensor_split[i]);
             }
-        } else {
-            auto_tensor_split.clear();
         }
     }
     const float * effective_tensor_split = auto_tensor_split.empty() ?
