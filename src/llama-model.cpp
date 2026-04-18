@@ -452,6 +452,7 @@ struct llama_model::impl {
     bool flash_moe_oracle_prefetch_enabled = false;
     bool flash_moe_temporal_prefetch_enabled = false;
     int32_t flash_moe_slot_bank_size = 0;
+    std::vector<int32_t> flash_moe_per_layer_slot_counts; // empty = uniform
     int32_t flash_moe_cache_io_split = 1;
     int32_t moe_n_expert_used = 0;
     std::string flash_moe_trace_file;
@@ -2837,6 +2838,42 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     pimpl->flash_moe_sidecar_entries.clear();
     pimpl->flash_moe_slot_bank_size = flash_moe_slot_bank ? (int32_t) flash_moe_slot_count : 0;
+    pimpl->flash_moe_per_layer_slot_counts.clear();
+
+    // If --moe-slot-bank was given as a comma-separated list, expand the segments
+    // over the MoE-layer range and store per-layer slot counts.
+    if (flash_moe_slot_bank && params.moe_slot_bank_n_segments > 1 && params.moe_slot_bank_segments != nullptr) {
+        const int dense_lead = std::max(0, (int) hparams.n_layer_dense_lead);
+        const int nextn      = std::max(0, (int) hparams.nextn_predict_layers);
+        const int moe_first  = std::min(dense_lead, n_layer);
+        const int moe_last   = std::max(moe_first, n_layer - nextn);      // exclusive
+        const int moe_range  = std::max(1, moe_last - moe_first);
+        const int n_segs     = params.moe_slot_bank_n_segments;
+
+        pimpl->flash_moe_per_layer_slot_counts.assign(n_layer, (int32_t) flash_moe_slot_count);
+        for (int il = 0; il < n_layer; il++) {
+            int moe_idx = il - moe_first;
+            if (moe_idx < 0) moe_idx = 0;
+            if (moe_idx >= moe_range) moe_idx = moe_range - 1;
+            int seg = moe_idx * n_segs / moe_range;
+            seg = std::min(seg, n_segs - 1);
+            int32_t v = params.moe_slot_bank_segments[seg];
+            if (hparams.n_expert > 0 && v > (int32_t) hparams.n_expert) {
+                v = (int32_t) hparams.n_expert;
+            }
+            if (v < 1) v = 1;
+            pimpl->flash_moe_per_layer_slot_counts[il] = v;
+        }
+
+        LLAMA_LOG_INFO("%s: Flash-MoE slot-bank: %d segments over %d MoE layers (range [%d, %d))\n",
+                __func__, n_segs, moe_range, moe_first, moe_last);
+        for (int s = 0; s < n_segs; s++) {
+            const int seg_start = moe_first + s * moe_range / n_segs;
+            const int seg_end   = moe_first + (s + 1) * moe_range / n_segs;
+            LLAMA_LOG_INFO("%s:   segment %d/%d: layers [%d, %d) = %d slots\n",
+                    __func__, s + 1, n_segs, seg_start, seg_end, params.moe_slot_bank_segments[s]);
+        }
+    }
 
     if (flash_moe_slot_bank && n_gpu_layers != 0) {
         if (flash_moe_experimental_gpu_bank) {
@@ -3054,7 +3091,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             const std::string tensor_name = tn.str();
             std::vector<int64_t> dims(ne);
             GGML_ASSERT(!dims.empty());
-            dims.back() = flash_moe_slot_count;
+            int64_t layer_slot_count = flash_moe_slot_count;
+            if (tn.bid >= 0 && !pimpl->flash_moe_per_layer_slot_counts.empty()) {
+                layer_slot_count = pimpl->flash_moe_per_layer_slot_counts[tn.bid];
+            }
+            dims.back() = layer_slot_count;
 
             const buft_list_t * routed_buft_list = &pimpl->cpu_buft_list;
             if (flash_moe_experimental_gpu_bank && tn.bid >= 0) {
@@ -8523,6 +8564,27 @@ int32_t llama_model::flash_moe_slot_bank_size() const {
     return pimpl->flash_moe_slot_bank_size;
 }
 
+int32_t llama_model::flash_moe_slot_bank_size_for_layer(int layer) const {
+    if (pimpl->flash_moe_per_layer_slot_counts.empty()) {
+        return pimpl->flash_moe_slot_bank_size;
+    }
+    if (layer < 0 || layer >= (int) pimpl->flash_moe_per_layer_slot_counts.size()) {
+        return pimpl->flash_moe_slot_bank_size;
+    }
+    return pimpl->flash_moe_per_layer_slot_counts[layer];
+}
+
+int32_t llama_model::flash_moe_slot_bank_max_size() const {
+    if (pimpl->flash_moe_per_layer_slot_counts.empty()) {
+        return pimpl->flash_moe_slot_bank_size;
+    }
+    int32_t m = 0;
+    for (int32_t v : pimpl->flash_moe_per_layer_slot_counts) {
+        if (v > m) m = v;
+    }
+    return m > 0 ? m : pimpl->flash_moe_slot_bank_size;
+}
+
 int32_t llama_model::flash_moe_cache_io_split() const {
     return pimpl->flash_moe_cache_io_split;
 }
@@ -9266,6 +9328,8 @@ llama_model_params llama_model_default_params() {
         /*.moe_slot_bank               =*/ 0,
         /*.moe_topk_override           =*/ 0,
         /*.moe_cache_io_split          =*/ 1,
+        /*.moe_slot_bank_n_segments    =*/ 0,
+        /*.moe_slot_bank_segments      =*/ nullptr,
     };
 
     return result;

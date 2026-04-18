@@ -333,9 +333,15 @@ extern "C" {
         bool moe_verify_sidecar; // validate sidecar metadata parity during model load
         bool moe_prefetch_temporal; // real runtime one-step temporal prefetch on top of slot-bank mode
 
-        int32_t moe_slot_bank; // slot-bank resident expert capacity per routed MoE layer
+        int32_t moe_slot_bank; // slot-bank resident expert capacity per routed MoE layer (or max of segments)
         int32_t moe_topk_override; // runtime reduction-only override for routed experts per token (0 = model metadata)
         int32_t moe_cache_io_split; // split each routed expert pread into N page-aligned chunks (1 = disabled)
+
+        // Optional per-segment slot counts. When set, the MoE layers are divided into
+        // moe_slot_bank_n_segments equal segments, each getting moe_slot_bank_segments[i] slots.
+        // When moe_slot_bank_n_segments == 0, moe_slot_bank is used uniformly.
+        int32_t moe_slot_bank_n_segments;
+        const int32_t * moe_slot_bank_segments;
     };
 
     struct llama_sampler_seq_config {

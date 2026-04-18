@@ -641,7 +641,8 @@ struct common_params {
     std::string moe_trace     = "";      // reserved trace output path                                 // NOLINT
     std::string moe_quant_map = "";      // reserved dynamic-quant policy path                         // NOLINT
     std::string oracle_dump   = "";      // llama-cli tensor oracle dump directory                     // NOLINT
-    int32_t     moe_slot_bank = 0;       // reserved slot-bank size                                    // NOLINT
+    int32_t     moe_slot_bank = 0;       // reserved slot-bank size (uniform)                          // NOLINT
+    std::vector<int32_t> moe_slot_bank_segments; // per-segment slot counts (N values = N equal segments) // NOLINT
     int32_t     moe_topk_override = 0;   // runtime reduction-only routed-expert override              // NOLINT
     int32_t     moe_cache_io_split = 1;  // split each routed expert pread into N aligned chunks       // NOLINT
     int32_t     moe_force_expert = -1;   // force routed selection to a single expert id              // NOLINT

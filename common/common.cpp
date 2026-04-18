@@ -1357,6 +1357,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_slot_bank      = params.moe_slot_bank;
     mparams.moe_topk_override  = params.moe_topk_override;
     mparams.moe_cache_io_split = params.moe_cache_io_split;
+    mparams.moe_slot_bank_n_segments = (int32_t) params.moe_slot_bank_segments.size();
+    mparams.moe_slot_bank_segments   = params.moe_slot_bank_segments.empty() ? nullptr : params.moe_slot_bank_segments.data();
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

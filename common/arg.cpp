@@ -29,6 +29,7 @@
 #include <list>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread> // for hardware_concurrency
 #include <vector>
@@ -2253,13 +2254,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_MODE"));
     add_opt(common_arg(
-        {"--moe-slot-bank"}, "N",
-        "Flash-MoE slot-bank resident expert capacity per routed MoE layer",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+        {"--moe-slot-bank"}, "N[,N,...]",
+        "Flash-MoE slot-bank resident expert capacity per routed MoE layer.\n"
+        "Single value = uniform (current behavior). Comma-separated values = N equal segments of MoE layers.\n"
+        "Example: --moe-slot-bank 200,184,170,180 gives more slots to early layers.",
+        [](common_params & params, const std::string & value) {
+            std::vector<int32_t> segs;
+            std::string token;
+            std::istringstream ss(value);
+            while (std::getline(ss, token, ',')) {
+                if (token.empty()) {
+                    throw std::invalid_argument("empty segment in --moe-slot-bank");
+                }
+                int v = std::stoi(token);
+                if (v < 0) {
+                    throw std::invalid_argument("invalid slot count in --moe-slot-bank");
+                }
+                segs.push_back(v);
             }
-            params.moe_slot_bank = value;
+            if (segs.empty()) {
+                throw std::invalid_argument("empty value for --moe-slot-bank");
+            }
+            if (segs.size() == 1) {
+                params.moe_slot_bank = segs[0];
+                params.moe_slot_bank_segments.clear();
+            } else {
+                params.moe_slot_bank_segments = segs;
+                params.moe_slot_bank = *std::max_element(segs.begin(), segs.end());
+            }
         }
     ).set_env("LLAMA_ARG_MOE_SLOT_BANK"));
     add_opt(common_arg(

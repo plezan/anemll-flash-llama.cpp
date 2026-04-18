@@ -41,7 +41,7 @@ class llama_flash_moe_slot_runtime : public llm_flash_moe_slot_runtime_i {
 public:
     explicit llama_flash_moe_slot_runtime(const llama_model & model)
             : model(model),
-              slot_count(model.flash_moe_slot_bank_size()),
+              slot_count(model.flash_moe_slot_bank_max_size()),
               expert_count(model.hparams.n_expert),
               resident_bank_source(model.flash_moe_resident_source_enabled()),
               oracle_all_hit(model.flash_moe_oracle_all_hit_enabled()),
@@ -68,12 +68,13 @@ public:
 
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto & state = layers[il];
-            state.n_slots = slot_count;
-            state.slot_to_expert.assign(slot_count, -1);
+            const int32_t layer_slots = model.flash_moe_slot_bank_size_for_layer((int) il);
+            state.n_slots = layer_slots;
+            state.slot_to_expert.assign(layer_slots, -1);
             state.expert_to_slot.assign(expert_count, -1);
-            state.slot_age.assign(slot_count, 0);
-            state.slot_access_count.assign(slot_count, 0);
-            state.slot_reserved_epoch.assign(slot_count, 0);
+            state.slot_age.assign(layer_slots, 0);
+            state.slot_access_count.assign(layer_slots, 0);
+            state.slot_reserved_epoch.assign(layer_slots, 0);
             state.request_seen_epoch.assign(expert_count, 0);
             state.request_slot.assign(expert_count, -1);
             state.temporal_prefetch_experts.reserve(std::max<int32_t>(1, model.moe_n_expert_used()));
@@ -968,10 +969,10 @@ private:
                 int32_t slot = state.expert_to_slot[expert];
                 if (slot < 0) {
                     slot = next_slot_for_layer[record.layer]++;
-                    if (slot >= slot_count) {
+                    if (slot >= state.n_slots) {
                         throw std::runtime_error(format(
                             "Flash-MoE oracle-all-hit needs %d slots in layer %d, but only %d are configured",
-                            slot + 1, record.layer, slot_count));
+                            slot + 1, record.layer, state.n_slots));
                     }
                     state.expert_to_slot[expert] = slot;
                     state.slot_to_expert[slot] = expert;
@@ -1173,11 +1174,15 @@ private:
             throw std::runtime_error(format("missing Flash-MoE sidecar entry for '%s'", ggml_get_name(tensor)));
         }
 
-        const size_t expected_slot_bytes = entry->bytes_per_expert * slot_count;
+        // In per-layer mode, each tensor may have a different slot count on its last dimension.
+        // Validate against the tensor's actual shape, not the global slot_count.
+        const int n_dims = ggml_n_dims(tensor);
+        const int64_t tensor_slots = n_dims > 0 ? tensor->ne[n_dims - 1] : 0;
+        const size_t expected_slot_bytes = entry->bytes_per_expert * tensor_slots;
         if (ggml_nbytes(tensor) != expected_slot_bytes) {
             throw std::runtime_error(format(
-                "Flash-MoE slot tensor '%s' has %zu bytes, expected %zu for %d slots",
-                ggml_get_name(tensor), ggml_nbytes(tensor), expected_slot_bytes, slot_count));
+                "Flash-MoE slot tensor '%s' has %zu bytes, expected %zu for %lld slots",
+                ggml_get_name(tensor), ggml_nbytes(tensor), expected_slot_bytes, (long long) tensor_slots));
         }
 
         tensor_out = tensor;
@@ -1393,7 +1398,7 @@ private:
     }
 
     void eager_materialize_full_bank_if_possible() {
-        if (!resident_full_bank_pending || !resident_bank_source || slot_count != expert_count) {
+        if (!resident_full_bank_pending || !resident_bank_source) {
             return;
         }
 
@@ -1403,6 +1408,10 @@ private:
         for (size_t layer = 0; layer < layers.size(); ++layer) {
             auto & state = layers[layer];
             if (!state.enabled) {
+                continue;
+            }
+            if (state.n_slots != expert_count) {
+                // Per-layer slot budgets may prevent a full mirror for some layers; skip them.
                 continue;
             }
 
